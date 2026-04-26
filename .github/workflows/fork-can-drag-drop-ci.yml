@@ -1,0 +1,224 @@
+# Fork-only CI for the GH#15689 fix (tab drag drop crashes when running as a
+# different user than the desktop session owner).
+#
+# Why this exists separately from build/pipelines/ci.yml: that pipeline runs
+# in Microsoft's Azure DevOps; forks can't trigger it. This workflow runs on
+# GitHub-hosted Windows runners and provides:
+#
+#   1. A unit-test pass for the DecideCanUwpDragDrop decision table
+#      (src/types/ut_types/UtilsTests.cpp).
+#   2. A cross-user runtime check using UserSessionMatchProbe.exe
+#      (src/tools/UserSessionMatchProbe). The probe prints its token-user
+#      SID; we run it twice (as the runner user and as a freshly provisioned
+#      local user) and assert the SIDs differ. That validates the Win32
+#      token-extraction primitive that the production fix relies on.
+#
+# Hosted runners live in Session 0 with no interactive desktop, so the
+# WTS-session-user lookup in the probe returns "unknown" here. That part of
+# the production logic (_classifySession in src/types/utils.cpp) needs manual
+# verification on a machine with a real interactive session - see the PR
+# description for repro steps.
+
+name: Fork CI - GH#15689 (tab drag drop cross-user)
+
+on:
+  push:
+    branches:
+      - 'fix/15689-*'
+      - 'main'
+  pull_request:
+    branches:
+      - 'main'
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      Configuration: Release
+      Platform: x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+        with:
+          nuget-version: latest
+
+      - name: Detect or bootstrap vcpkg
+        shell: pwsh
+        run: |
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsRoot = & $vswhere -latest -requires Microsoft.VisualStudio.Component.Vcpkg -property installationPath 2>$null
+          if (-not [string]::IsNullOrEmpty($vsRoot)) {
+            $vcpkg = Join-Path $vsRoot 'VC\vcpkg'
+            if (Test-Path (Join-Path $vcpkg 'vcpkg.exe')) {
+              Write-Host "Using VS-bundled vcpkg at $vcpkg"
+              "VCPKG_ROOT=$vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+              return
+            }
+          }
+          $local = Join-Path $env:GITHUB_WORKSPACE 'dep\vcpkg'
+          if (Test-Path $local) { Remove-Item -Recurse -Force $local }
+          git clone --depth=1 https://github.com/microsoft/vcpkg $local
+          & "$local\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed" }
+          Write-Host "Using locally bootstrapped vcpkg at $local"
+          "VCPKG_ROOT=$local" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Restore NuGet packages (build)
+        shell: pwsh
+        run: |
+          nuget restore build\packages.config -ConfigFile NuGet.Config -PackagesDirectory packages
+
+      - name: Restore NuGet packages (dep)
+        shell: pwsh
+        run: |
+          nuget restore dep\nuget\packages.config -ConfigFile NuGet.Config -PackagesDirectory packages
+
+      - name: Restore NuGet packages (solution-level project deps)
+        shell: pwsh
+        run: |
+          # The unit-test and probe vcxprojs reference packages via PackageReference
+          # / Microsoft.Windows.CppWinRT props. Trigger their per-project restore
+          # explicitly (the .slnx-level restore won't work with the nuget version
+          # currently shipped on hosted runners).
+          msbuild src\types\ut_types\Types.Unit.Tests.vcxproj `
+            /t:Restore `
+            /p:Configuration=Release /p:Platform=x64 `
+            /p:SolutionDir=$env:GITHUB_WORKSPACE\
+
+      - name: Build Types unit tests (x64 Release)
+        shell: pwsh
+        run: |
+          msbuild src\types\ut_types\Types.Unit.Tests.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SolutionDir=$env:GITHUB_WORKSPACE\ `
+            /m
+
+      - name: Build UserSessionMatchProbe (x64 Release)
+        shell: pwsh
+        run: |
+          msbuild src\tools\UserSessionMatchProbe\UserSessionMatchProbe.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:SolutionDir=$env:GITHUB_WORKSPACE\ `
+            /m
+
+      - name: Locate built artifacts
+        id: artifacts
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE 'bin\x64\Release'),
+            (Join-Path $env:GITHUB_WORKSPACE 'bin\Release\x64')
+          )
+          $bin = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bin) {
+            Write-Host "No bin dir found, scanning entire workspace for outputs..."
+            $bin = (Get-ChildItem -Recurse $env:GITHUB_WORKSPACE -Filter 'UserSessionMatchProbe.exe' -ErrorAction SilentlyContinue | Select-Object -First 1).Directory.FullName
+          }
+          Write-Host "Bin dir: $bin"
+          if ($bin) {
+            Get-ChildItem -Recurse $bin | Where-Object { $_.Name -match '(Types\.Unit\.Tests\.dll|UserSessionMatchProbe\.exe|^te\.exe$)' } | ForEach-Object {
+              Write-Host "  $($_.FullName)"
+            }
+          }
+          "BinDir=$bin" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Run Types unit tests
+        shell: pwsh
+        run: |
+          $bin = '${{ steps.artifacts.outputs.BinDir }}'
+          if (-not $bin) { throw "no bin dir located" }
+          .\build\scripts\Run-Tests.ps1 `
+            -MatchPattern 'Types.Unit.Tests.dll' `
+            -Platform 'x64' `
+            -Configuration 'Release' `
+            -Root $bin
+
+      - name: Smoke-run probe as runner user
+        id: probe-runner
+        shell: pwsh
+        run: |
+          $bin = '${{ steps.artifacts.outputs.BinDir }}'
+          $exe = Get-ChildItem -Recurse $bin -Filter 'UserSessionMatchProbe.exe' | Select-Object -First 1
+          if (-not $exe) { throw "UserSessionMatchProbe.exe not found under $bin" }
+          Write-Host "Running probe at $($exe.FullName)"
+          $out = & $exe.FullName 2>&1
+          $code = $LASTEXITCODE
+          Write-Host "--- runner-user probe output ---"
+          $out | ForEach-Object { Write-Host $_ }
+          Write-Host "--- runner-user exit code: $code ---"
+          $sidLine = $out | Where-Object { $_ -match 'process token user SID:' } | Select-Object -First 1
+          if (-not $sidLine) { throw "probe did not print a process token user SID" }
+          $runnerSid = ($sidLine -replace '.*SID:\s*','').Trim()
+          if (-not $runnerSid -or $runnerSid -eq '<unavailable>') { throw "could not parse runner SID" }
+          Write-Host "Runner SID: $runnerSid"
+          "ProbePath=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "RunnerSid=$runnerSid"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Provision temp local user and run probe cross-user
+        shell: pwsh
+        run: |
+          $probe = '${{ steps.probe-runner.outputs.ProbePath }}'
+          $runnerSid = '${{ steps.probe-runner.outputs.RunnerSid }}'
+          $userName = "ProbeAlt$([System.Guid]::NewGuid().ToString('N').Substring(0,6))"
+          $bytes = New-Object byte[] 24
+          [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+          $rawPw = ([Convert]::ToBase64String($bytes)) + '!Aa1'
+          Write-Host "Creating temporary user: $userName"
+          & net user $userName $rawPw /add /Y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "net user /add failed" }
+
+          try {
+            & net localgroup "Users" $userName /add 2>$null | Out-Null
+
+            $secPw = ConvertTo-SecureString $rawPw -AsPlainText -Force
+            $cred  = New-Object System.Management.Automation.PSCredential($userName, $secPw)
+            $stdoutFile = Join-Path $env:RUNNER_TEMP "probe-altuser-stdout.txt"
+            $stderrFile = Join-Path $env:RUNNER_TEMP "probe-altuser-stderr.txt"
+
+            Write-Host "Launching probe as $userName via Start-Process -Credential"
+            $p = Start-Process -FilePath $probe `
+                               -Credential $cred `
+                               -RedirectStandardOutput $stdoutFile `
+                               -RedirectStandardError  $stderrFile `
+                               -PassThru -Wait -NoNewWindow `
+                               -WorkingDirectory $env:RUNNER_TEMP
+            $altCode = $p.ExitCode
+            Write-Host "--- alt-user probe stdout ---"
+            if (Test-Path $stdoutFile) { Get-Content $stdoutFile | ForEach-Object { Write-Host $_ } }
+            Write-Host "--- alt-user probe stderr ---"
+            if (Test-Path $stderrFile) { Get-Content $stderrFile | ForEach-Object { Write-Host $_ } }
+            Write-Host "--- alt-user exit code: $altCode ---"
+
+            $altOut = if (Test-Path $stdoutFile) { Get-Content $stdoutFile } else { @() }
+            $sidLine = $altOut | Where-Object { $_ -match 'process token user SID:' } | Select-Object -First 1
+            if (-not $sidLine) {
+              throw "alt-user probe did not print a process token user SID"
+            }
+            $altSid = ($sidLine -replace '.*SID:\s*','').Trim()
+            Write-Host "Alt user SID: $altSid"
+
+            if ($altSid -eq $runnerSid) {
+              throw "FAIL: alt-user SID equals runner SID ($runnerSid). Cross-user launch did not produce a different token user."
+            }
+            Write-Host "PASS: probe extracted distinct token-user SIDs across users."
+            Write-Host "  runner SID = $runnerSid"
+            Write-Host "  alt    SID = $altSid"
+          }
+          finally {
+            Write-Host "Cleaning up temp user $userName"
+            & net user $userName /delete 2>$null | Out-Host
+          }

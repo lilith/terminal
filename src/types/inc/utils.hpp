@@ -113,6 +113,34 @@ namespace Microsoft::Console::Utils
     bool CanUwpDragDrop();
     bool IsRunningElevated();
 
+    // Inputs to DecideCanUwpDragDrop, factored out so the decision table can be
+    // unit-tested without driving the actual Win32 token / WTS APIs.
+    enum class DragDropElevationCategory
+    {
+        // UAC is disabled and we have the default-admin token (no split token).
+        // Treated as if not admin: existing GH#7754, GH#11096 behavior.
+        UacDisabledAdmin,
+        // Process token is a member of the local Administrators group.
+        Elevated,
+        // Anything else (regular interactive user).
+        Standard,
+    };
+
+    enum class DragDropSessionCategory
+    {
+        // Process token user matches the user logged into the current WTS session.
+        Match,
+        // Process token user is different from the session's logged-on user.
+        // This is the GH#15689 case (e.g. BeyondTrust launching us via
+        // CreateProcessAsUser under an alternate account).
+        Different,
+        // Couldn't determine - Session 0, no interactive user, lookup failed,
+        // etc. Treated as "trust the caller, don't disable drag drop".
+        Unknown,
+    };
+
+    bool DecideCanUwpDragDrop(DragDropElevationCategory elev, DragDropSessionCategory session) noexcept;
+
     // This function is only ever used by the ConPTY connection in
     // TerminalConnection. However, that library does not have a good system of
     // tests set up. Since this function has a plethora of edge cases that would

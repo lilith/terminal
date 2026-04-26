@@ -35,6 +35,12 @@ class UtilsTests
 
     TEST_METHOD(TestEvaluateStartingDirectory);
 
+    TEST_METHOD(TestDecideCanUwpDragDrop_AllowsStandardSameUser);
+    TEST_METHOD(TestDecideCanUwpDragDrop_DeniesStandardDifferentUser);
+    TEST_METHOD(TestDecideCanUwpDragDrop_AllowsStandardUnknownSession);
+    TEST_METHOD(TestDecideCanUwpDragDrop_DeniesElevatedAlways);
+    TEST_METHOD(TestDecideCanUwpDragDrop_AllowsUacDisabledAdminAlways);
+
     void _VerifyXTermColorResult(const std::wstring_view wstr, DWORD colorValue);
     void _VerifyXTermColorInvalid(const std::wstring_view wstr);
 };
@@ -617,4 +623,59 @@ void UtilsTests::TestEvaluateStartingDirectory()
         test(L"/", cwd, L"/");
         test(L"/dev", cwd, L"/dev");
     }
+}
+
+
+void UtilsTests::TestDecideCanUwpDragDrop_AllowsStandardSameUser()
+{
+    // Standard (non-elevated) user, process token user matches the WTS session
+    // user: classic happy path. Drag-drop must remain enabled.
+    VERIFY_IS_TRUE(DecideCanUwpDragDrop(DragDropElevationCategory::Standard,
+                                         DragDropSessionCategory::Match));
+}
+
+void UtilsTests::TestDecideCanUwpDragDrop_DeniesStandardDifferentUser()
+{
+    // GH#15689: standard non-elevated process running as a different user than
+    // the desktop session owner (e.g. BeyondTrust CreateProcessAsUser scenario).
+    // The XAML drag-drop service crashes in this case, so we must report
+    // drag-drop as unavailable.
+    VERIFY_IS_FALSE(DecideCanUwpDragDrop(DragDropElevationCategory::Standard,
+                                          DragDropSessionCategory::Different));
+}
+
+void UtilsTests::TestDecideCanUwpDragDrop_AllowsStandardUnknownSession()
+{
+    // We couldn't determine the session user (Session 0, no interactive user,
+    // lookup failed, etc.). Conservative choice that matches pre-fix behavior:
+    // allow drag-drop. This mirrors the behavior before GH#15689 - users who
+    // weren't affected before should not regress.
+    VERIFY_IS_TRUE(DecideCanUwpDragDrop(DragDropElevationCategory::Standard,
+                                         DragDropSessionCategory::Unknown));
+}
+
+void UtilsTests::TestDecideCanUwpDragDrop_DeniesElevatedAlways()
+{
+    // GH#13928: elevated processes always have broken drag-drop, regardless of
+    // session match status. The session input must not change the answer.
+    VERIFY_IS_FALSE(DecideCanUwpDragDrop(DragDropElevationCategory::Elevated,
+                                          DragDropSessionCategory::Match));
+    VERIFY_IS_FALSE(DecideCanUwpDragDrop(DragDropElevationCategory::Elevated,
+                                          DragDropSessionCategory::Different));
+    VERIFY_IS_FALSE(DecideCanUwpDragDrop(DragDropElevationCategory::Elevated,
+                                          DragDropSessionCategory::Unknown));
+}
+
+void UtilsTests::TestDecideCanUwpDragDrop_AllowsUacDisabledAdminAlways()
+{
+    // GH#7754, GH#11096: when UAC is disabled and the user has the default
+    // admin token (no split), there's no real privilege boundary. Drag-drop
+    // works fine in practice. The cross-user check from GH#15689 also doesn't
+    // apply here, so the session input must not change the answer.
+    VERIFY_IS_TRUE(DecideCanUwpDragDrop(DragDropElevationCategory::UacDisabledAdmin,
+                                         DragDropSessionCategory::Match));
+    VERIFY_IS_TRUE(DecideCanUwpDragDrop(DragDropElevationCategory::UacDisabledAdmin,
+                                         DragDropSessionCategory::Different));
+    VERIFY_IS_TRUE(DecideCanUwpDragDrop(DragDropElevationCategory::UacDisabledAdmin,
+                                         DragDropSessionCategory::Unknown));
 }

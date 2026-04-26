@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 #include "precomp.h"
+#include <wtsapi32.h>
 #include "inc/utils.hpp"
 
 #include <til/string.h>
@@ -955,48 +956,144 @@ GUID Utils::CreateV5Uuid(const GUID& namespaceGuid, const std::span<const std::b
     return EndianSwap(newGuid);
 }
 
-// * Elevated users cannot use the modern drag drop experience. This is
-//   specifically normal users running the Terminal as admin
-// * The Default Administrator, who does not have a split token, CAN drag drop
-//   perfectly fine. So in that case, we want to return false.
-// * This has to be kept separate from IsRunningElevated, which is exclusively
-//   used for "is this instance running as admin".
+// Pure decision function for CanUwpDragDrop, broken out so the decision table
+// can be exercised by unit tests without needing the actual Win32 token / WTS
+// state. See GH#13928 (elevated case) and GH#15689 (cross-user case) for the
+// motivating bugs.
+bool Utils::DecideCanUwpDragDrop(DragDropElevationCategory elev, DragDropSessionCategory session) noexcept
+{
+    switch (elev)
+    {
+    case DragDropElevationCategory::UacDisabledAdmin:
+        // UAC entirely disabled, default admin token without a split: treat as
+        // if the user isn't admin at all. There's no real privilege boundary,
+        // and the cross-user check doesn't apply either. See GH#7754, GH#11096.
+        return true;
+    case DragDropElevationCategory::Elevated:
+        // Elevated users cannot use the modern drag drop experience. See GH#13928.
+        return false;
+    case DragDropElevationCategory::Standard:
+    default:
+        // GH#15689: if we're running unelevated but as a different user than
+        // the one who owns the interactive session (e.g. privilege-management
+        // software like BeyondTrust uses CreateProcessAsUser to launch us
+        // under a service / alternate account), the modern drag-drop service
+        // can't bridge user identities and the XAML drag-drop code crashes.
+        // If we couldn't determine the session user (Session 0, no interactive
+        // user, lookup failed) we fall through to "allow" - that's the
+        // conservative choice that matches pre-fix behavior.
+        return session != DragDropSessionCategory::Different;
+    }
+}
+
+namespace
+{
+    Utils::DragDropElevationCategory _classifyElevation(HANDLE processToken)
+    {
+        const auto elevationType = wil::get_token_information<TOKEN_ELEVATION_TYPE>(processToken);
+        const auto elevationState = wil::get_token_information<TOKEN_ELEVATION>(processToken);
+        if (elevationType == TokenElevationTypeDefault && elevationState.TokenIsElevated)
+        {
+            return Utils::DragDropElevationCategory::UacDisabledAdmin;
+        }
+        if (wil::test_token_membership(nullptr, SECURITY_NT_AUTHORITY, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS))
+        {
+            return Utils::DragDropElevationCategory::Elevated;
+        }
+        return Utils::DragDropElevationCategory::Standard;
+    }
+
+    // Compares the process token's user SID against the SID of the user logged
+    // into this WTS session. Returns Unknown for service/Session-0 contexts or
+    // when any of the lookups fail.
+    Utils::DragDropSessionCategory _classifySession(HANDLE processToken) noexcept
+    try
+    {
+        const auto tokenUser = wil::get_token_information<TOKEN_USER>(processToken);
+        if (!tokenUser || !tokenUser->User.Sid)
+        {
+            return Utils::DragDropSessionCategory::Unknown;
+        }
+
+        DWORD sessionId{};
+        if (!::ProcessIdToSessionId(::GetCurrentProcessId(), &sessionId))
+        {
+            return Utils::DragDropSessionCategory::Unknown;
+        }
+
+        wchar_t* userBuffer{};
+        DWORD userLen{};
+        if (!::WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessionId, WTSUserName, &userBuffer, &userLen))
+        {
+            return Utils::DragDropSessionCategory::Unknown;
+        }
+        auto freeUser = wil::scope_exit([&] { ::WTSFreeMemory(userBuffer); });
+        if (userLen <= sizeof(wchar_t) || !userBuffer || userBuffer[0] == L'\0')
+        {
+            // Session has no logged-on interactive user (Session 0, locked, etc.).
+            return Utils::DragDropSessionCategory::Unknown;
+        }
+
+        wchar_t* domainBuffer{};
+        DWORD domainLen{};
+        const auto haveDomain = ::WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessionId, WTSDomainName, &domainBuffer, &domainLen);
+        auto freeDomain = wil::scope_exit([&] { if (haveDomain && domainBuffer) { ::WTSFreeMemory(domainBuffer); } });
+
+        std::wstring fullName;
+        if (haveDomain && domainBuffer && domainLen > sizeof(wchar_t) && domainBuffer[0] != L'\0')
+        {
+            fullName.append(domainBuffer);
+            fullName.push_back(L'\\');
+        }
+        fullName.append(userBuffer);
+
+        BYTE sidBuf[SECURITY_MAX_SID_SIZE]{};
+        DWORD sidBufLen = sizeof(sidBuf);
+        wchar_t referencedDomain[256]{};
+        DWORD referencedDomainLen = ARRAYSIZE(referencedDomain);
+        SID_NAME_USE use{};
+        if (!::LookupAccountNameW(nullptr, fullName.c_str(), sidBuf, &sidBufLen, referencedDomain, &referencedDomainLen, &use))
+        {
+            return Utils::DragDropSessionCategory::Unknown;
+        }
+
+        return ::EqualSid(tokenUser->User.Sid, sidBuf)
+                   ? Utils::DragDropSessionCategory::Match
+                   : Utils::DragDropSessionCategory::Different;
+    }
+    catch (...)
+    {
+        LOG_CAUGHT_EXCEPTION();
+        return Utils::DragDropSessionCategory::Unknown;
+    }
+}
+
+#pragma comment(lib, "wtsapi32.lib")
+
 bool Utils::CanUwpDragDrop()
 {
-    // There's a lot of wacky double negatives here so that the logic is
-    // basically the same as IsRunningElevated, but the end result semantically
-    // makes sense as "CanDragDrop".
-    static auto isDragDropBroken = []() {
+    static auto canDragDrop = []() {
         try
         {
             wil::unique_handle processToken{ GetCurrentProcessToken() };
-            const auto elevationType = wil::get_token_information<TOKEN_ELEVATION_TYPE>(processToken.get());
-            const auto elevationState = wil::get_token_information<TOKEN_ELEVATION>(processToken.get());
-            if (elevationType == TokenElevationTypeDefault && elevationState.TokenIsElevated)
-            {
-                // In this case, the user has UAC entirely disabled. This is sort of
-                // weird, we treat this like the user isn't an admin at all. There's no
-                // separation of powers, so the things we normally want to gate on
-                // "having special powers" doesn't apply.
-                //
-                // See GH#7754, GH#11096
-                return false;
-                // drag drop is _not_ broken -> they _can_ drag drop
-            }
-
-            // If they are running admin, they cannot drag drop.
-            return wil::test_token_membership(nullptr, SECURITY_NT_AUTHORITY, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS);
+            const auto elev = _classifyElevation(processToken.get());
+            // Only bother with the cross-user check when it can actually change
+            // the answer: in the elevated and UAC-disabled-admin paths the
+            // session result is irrelevant.
+            const auto session = (elev == DragDropElevationCategory::Standard)
+                                     ? _classifySession(processToken.get())
+                                     : DragDropSessionCategory::Unknown;
+            return DecideCanUwpDragDrop(elev, session);
         }
         catch (...)
         {
             LOG_CAUGHT_EXCEPTION();
-            // This failed? That's very peculiar indeed. Let's err on the side
-            // of "drag drop is broken", just in case.
-            return true;
+            // Err on the side of "drag drop is broken" - matches pre-refactor behavior.
+            return false;
         }
     }();
 
-    return !isDragDropBroken;
+    return canDragDrop;
 }
 
 // See CanUwpDragDrop, GH#13928 for why this is different.

@@ -33,7 +33,7 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 60
 
     env:
@@ -48,6 +48,16 @@ jobs:
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
+
+      - name: Inventory installed Windows SDKs (debug)
+        shell: pwsh
+        run: |
+          $sdkRoot = 'C:\Program Files (x86)\Windows Kits\10\Include'
+          if (Test-Path $sdkRoot) {
+            Get-ChildItem $sdkRoot | ForEach-Object { Write-Host "SDK: $($_.Name)" }
+          } else {
+            Write-Host "No Windows Kits SDK directory found"
+          }
 
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
